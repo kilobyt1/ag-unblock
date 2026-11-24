@@ -75,11 +75,11 @@ BIN_TARGETS = [
     HOME / ".local/bin/agy",
 ]
 
-_JS_CANDIDATES = [
+JS_TARGETS = [
     Path("/opt/antigravity-ide-Linux/resources/app/out/main.js"),
     HOME / "Desktop/Antigravity IDE/resources/app/out/main.js",
+    HOME / "Desktops/Desktop1/Antigravity IDE/resources/app/out/main.js",
 ]
-JS_TARGETS = [p for p in _JS_CANDIDATES if p.exists()] or _JS_CANDIDATES[:1]
 
 # Бэкапы лежат рядом с инструментом, чтобы проект был самодостаточным.
 BACKUP_DIR = Path(__file__).resolve().parent / "backup"
