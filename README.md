@@ -23,9 +23,14 @@
 
 ## Команды
 
+Запуск без аргументов (`python3 ag-unblock.py` / `python ag-unblock-win.py`) открывает встроенный GUI (`tkinter`) с кнопками управления и ссылкой на чат поддержки.
+
+Чат поддержки (Telegram): https://t.me/+_jsj3pvTqwc4Yzg6
+
 ### Linux
 
 ```bash
+python3 ag-unblock.py           # открыть GUI
 python3 ag-unblock.py status    # состояние всех целей + DNS
 python3 ag-unblock.py apply     # наложить патчи (с бэкапами)
 python3 ag-unblock.py revert    # откатить к оригиналам

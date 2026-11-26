@@ -17,7 +17,9 @@ ag-unblock-win — порт ag-unblock под Windows 10.
   verify              - проверка DNS-подмены, TLS-сертификата Google и ответа gate-хоста
 """
 
+import contextlib
 import hashlib
+import io
 import os
 import re
 import shutil
@@ -25,7 +27,11 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
+import webbrowser
 from pathlib import Path
+
+SUPPORT_URL = "https://t.me/+_jsj3pvTqwc4Yzg6"
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -378,10 +384,114 @@ def cmd_verify() -> int:
     return 0 if ok else 1
 
 
-def main() -> int:
-    if len(sys.argv) < 2:
+def run_gui() -> int:
+    try:
+        import tkinter as tk
+        from tkinter import scrolledtext
+    except Exception:
+        print(f"tkinter не найден — используйте CLI-команды.\nЧат поддержки: {SUPPORT_URL}")
         print(__doc__)
         return 2
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        print(f"Не удалось открыть окно GUI — используйте CLI-команды.\nЧат поддержки: {SUPPORT_URL}")
+        print(__doc__)
+        return 2
+
+    root.title("ag-unblock (Windows)")
+    root.geometry("780x520")
+    root.configure(bg="#18181b")
+
+    top = tk.Frame(root, bg="#18181b")
+    top.pack(fill=tk.X, padx=12, pady=(10, 6))
+    tk.Label(top, text="ag-unblock (Windows 10/11)", fg="#f4f4f5", bg="#18181b",
+             font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT)
+    tk.Button(top, text="Чат поддержки (Telegram)",
+              command=lambda: webbrowser.open(SUPPORT_URL),
+              bg="#0284c7", fg="#ffffff", activebackground="#0369a1",
+              activeforeground="#ffffff", relief=tk.FLAT, padx=10, pady=4,
+              cursor="hand2").pack(side=tk.RIGHT)
+
+    btns = tk.Frame(root, bg="#18181b")
+    btns.pack(fill=tk.X, padx=12, pady=6)
+
+    skip_node_var = tk.BooleanVar(value=True)
+
+    log = scrolledtext.ScrolledText(
+        root, bg="#09090b", fg="#e4e4e7", insertbackground="#e4e4e7",
+        font=("Consolas", 10), relief=tk.FLAT, padx=8, pady=8, state=tk.DISABLED
+    )
+    log.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
+
+    action_buttons: list[tk.Button] = []
+
+    def append_log(text: str) -> None:
+        log.configure(state=tk.NORMAL)
+        log.delete("1.0", tk.END)
+        log.insert(tk.END, text)
+        log.see(tk.END)
+        log.configure(state=tk.DISABLED)
+
+    def run_task(fn) -> None:
+        for b in action_buttons:
+            b.configure(state=tk.DISABLED)
+        append_log("Выполняется...\n")
+
+        def worker() -> None:
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    fn()
+            except Exception as e:
+                buf.write(f"\nОшибка: {e}\n")
+            out = buf.getvalue()
+
+            def done() -> None:
+                append_log(out)
+                for b in action_buttons:
+                    b.configure(state=tk.NORMAL)
+
+            root.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    for label, fn, bg in [
+        ("Статус", cmd_status, "#27272a"),
+        ("Применить патч", lambda: cmd_apply(skip_node=skip_node_var.get()), "#2563eb"),
+        ("Откатить", cmd_revert, "#27272a"),
+        ("Проверить сеть", cmd_verify, "#27272a"),
+    ]:
+        b = tk.Button(btns, text=label, command=lambda f=fn: run_task(f),
+                      bg=bg, fg="#f4f4f5", activebackground="#3f3f46",
+                      activeforeground="#ffffff", relief=tk.FLAT, padx=12, pady=6,
+                      cursor="hand2")
+        b.pack(side=tk.LEFT, padx=(0, 8))
+        action_buttons.append(b)
+
+    tk.Checkbutton(
+        btns, text="Без Node.js (--no-node)", variable=skip_node_var,
+        bg="#18181b", fg="#d4d4d8", selectcolor="#27272a",
+        activebackground="#18181b", activeforeground="#ffffff"
+    ).pack(side=tk.RIGHT)
+
+    footer = tk.Frame(root, bg="#18181b")
+    footer.pack(fill=tk.X, padx=12, pady=(0, 8))
+    link = tk.Label(footer, text=f"Чат поддержки: {SUPPORT_URL}",
+                    fg="#38bdf8", bg="#18181b", cursor="hand2",
+                    font=("Segoe UI", 9, "underline"))
+    link.pack(side=tk.LEFT)
+    link.bind("<Button-1>", lambda _e: webbrowser.open(SUPPORT_URL))
+
+    root.after(100, lambda: run_task(cmd_status))
+    root.mainloop()
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 2 or sys.argv[1] in ("gui", "--gui"):
+        return run_gui()
     cmd = sys.argv[1]
     flags = set(sys.argv[2:])
     if cmd == "status":
@@ -392,6 +502,10 @@ def main() -> int:
         return cmd_revert()
     if cmd == "verify":
         return cmd_verify()
+    if cmd == "support":
+        print(f"Чат поддержки: {SUPPORT_URL}")
+        webbrowser.open(SUPPORT_URL)
+        return 0
     print(__doc__)
     return 2
 

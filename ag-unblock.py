@@ -33,7 +33,9 @@ ag-unblock — обход региональных ограничений Antigr
   verify   - сетевая проверка: DNS-подмена + TLS + ответ сервера
 """
 
+import contextlib
 import hashlib
+import io
 import os
 import re
 import shutil
@@ -41,7 +43,11 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
+import webbrowser
 from pathlib import Path
+
+SUPPORT_URL = "https://t.me/+_jsj3pvTqwc4Yzg6"
 
 # --- патч клиентского гейта ------------------------------------------------
 
@@ -331,10 +337,113 @@ def cmd_verify() -> int:
     return 0 if ok else 1
 
 
+def run_gui() -> int:
+    try:
+        import tkinter as tk
+        from tkinter import scrolledtext
+    except Exception:
+        print(f"tkinter не найден — используйте CLI-команды.\nЧат поддержки: {SUPPORT_URL}")
+        print(__doc__)
+        return 2
+
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        print(f"Нет графической сессии — используйте CLI-команды.\nЧат поддержки: {SUPPORT_URL}")
+        print(__doc__)
+        return 2
+
+    root.title("ag-unblock")
+    root.geometry("760x500")
+    root.configure(bg="#18181b")
+
+    top = tk.Frame(root, bg="#18181b")
+    top.pack(fill=tk.X, padx=12, pady=(10, 6))
+    tk.Label(top, text="ag-unblock (Linux)", fg="#f4f4f5", bg="#18181b",
+             font=("TkDefaultFont", 13, "bold")).pack(side=tk.LEFT)
+    tk.Button(top, text="Чат поддержки (Telegram)",
+              command=lambda: webbrowser.open(SUPPORT_URL),
+              bg="#0284c7", fg="#ffffff", activebackground="#0369a1",
+              activeforeground="#ffffff", relief=tk.FLAT, padx=10, pady=4,
+              cursor="hand2").pack(side=tk.RIGHT)
+
+    btns = tk.Frame(root, bg="#18181b")
+    btns.pack(fill=tk.X, padx=12, pady=6)
+
+    log = scrolledtext.ScrolledText(
+        root, bg="#09090b", fg="#e4e4e7", insertbackground="#e4e4e7",
+        font=("Monospace", 10), relief=tk.FLAT, padx=8, pady=8, state=tk.DISABLED
+    )
+    log.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
+
+    action_buttons: list[tk.Button] = []
+
+    def append_log(text: str) -> None:
+        log.configure(state=tk.NORMAL)
+        log.delete("1.0", tk.END)
+        log.insert(tk.END, text)
+        log.see(tk.END)
+        log.configure(state=tk.DISABLED)
+
+    def run_task(fn) -> None:
+        for b in action_buttons:
+            b.configure(state=tk.DISABLED)
+        append_log("Выполняется...\n")
+
+        def worker() -> None:
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    fn()
+            except Exception as e:
+                buf.write(f"\nОшибка: {e}\n")
+            out = buf.getvalue()
+
+            def done() -> None:
+                append_log(out)
+                for b in action_buttons:
+                    b.configure(state=tk.NORMAL)
+
+            root.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    for label, fn, bg in [
+        ("Статус", cmd_status, "#27272a"),
+        ("Применить патч", cmd_apply, "#2563eb"),
+        ("Откатить", cmd_revert, "#27272a"),
+        ("Проверить сеть", cmd_verify, "#27272a"),
+    ]:
+        b = tk.Button(btns, text=label, command=lambda f=fn: run_task(f),
+                      bg=bg, fg="#f4f4f5", activebackground="#3f3f46",
+                      activeforeground="#ffffff", relief=tk.FLAT, padx=12, pady=6,
+                      cursor="hand2")
+        b.pack(side=tk.LEFT, padx=(0, 8))
+        action_buttons.append(b)
+
+    footer = tk.Frame(root, bg="#18181b")
+    footer.pack(fill=tk.X, padx=12, pady=(0, 8))
+    link = tk.Label(footer, text=f"Чат поддержки: {SUPPORT_URL}",
+                    fg="#38bdf8", bg="#18181b", cursor="hand2",
+                    font=("TkDefaultFont", 9, "underline"))
+    link.pack(side=tk.LEFT)
+    link.bind("<Button-1>", lambda _e: webbrowser.open(SUPPORT_URL))
+
+    root.after(100, lambda: run_task(cmd_status))
+    root.mainloop()
+    return 0
+
+
 def main() -> int:
     cmds = {"status": cmd_status, "apply": cmd_apply,
             "revert": cmd_revert, "verify": cmd_verify}
-    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+    if len(sys.argv) < 2 or sys.argv[1] in ("gui", "--gui"):
+        return run_gui()
+    if sys.argv[1] == "support":
+        print(f"Чат поддержки: {SUPPORT_URL}")
+        webbrowser.open(SUPPORT_URL)
+        return 0
+    if sys.argv[1] not in cmds:
         print(__doc__)
         return 2
     return cmds[sys.argv[1]]()
