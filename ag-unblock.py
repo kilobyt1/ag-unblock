@@ -44,6 +44,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import urllib.request
 import webbrowser
 from pathlib import Path
 
@@ -75,20 +76,19 @@ JS_RE_AUTH = re.compile(
 # --- пути ------------------------------------------------------------------
 
 HOME = Path.home()
-BIN_TARGETS = [
+DEFAULT_BIN_TARGETS = [
     Path("/opt/antigravity-Linux/resources/bin/language_server"),  # Antigravity 2.0
     HOME / ".gemini/bin/agy",      # Antigravity CLI и бэкенд IDE (OneLS)
     HOME / ".local/bin/agy",
 ]
 
-JS_TARGETS = [
+DEFAULT_JS_TARGETS = [
     Path("/opt/antigravity-ide-Linux/resources/app/out/main.js"),
-    HOME / "Desktop/Antigravity IDE/resources/app/out/main.js",
-    HOME / "Desktops/Desktop1/Antigravity IDE/resources/app/out/main.js",
 ]
 
-# Бэкапы лежат рядом с инструментом, чтобы проект был самодостаточным.
+# Бэкапы и пользовательские пути лежат рядом с инструментом.
 BACKUP_DIR = Path(__file__).resolve().parent / "backup"
+PATHS_FILE = Path(__file__).resolve().parent / "paths.txt"
 MARKER = b"// UNLOCKED-BY-AG-UNBLOCK"
 
 GATE_HOSTS = [
@@ -96,6 +96,79 @@ GATE_HOSTS = [
     "cloudcode-pa.googleapis.com",
     "aicode.googleapis.com",
 ]
+AUTH_HOST = "oauth2.googleapis.com"
+BLOCKED_COUNTRIES = {"RU", "BY", "RUSSIA", "BELARUS"}
+
+
+def _clean_path(raw: str) -> Path:
+    return Path(raw.strip().strip('"').strip("'")).expanduser()
+
+
+def load_saved_paths() -> list[Path]:
+    if not PATHS_FILE.is_file():
+        return []
+    out = []
+    for line in PATHS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            out.append(_clean_path(s))
+    return out
+
+
+def expand_custom_path(p: Path) -> tuple[list[Path], list[Path]]:
+    bins: list[Path] = []
+    jss: list[Path] = []
+    if p.is_file():
+        if p.suffix.lower() == ".js":
+            jss.append(p)
+        else:
+            bins.append(p)
+        return bins, jss
+    if p.is_dir():
+        for sub in (p / "resources" / "bin", p / "resources" / "app" / "extensions" / "antigravity" / "bin", p / "bin", p):
+            if sub.is_dir():
+                for pat in ("language_server*", "agy"):
+                    for f in sorted(sub.glob(pat)):
+                        if f.is_file() and f.suffix.lower() not in (".json", ".js", ".txt", ".tmp"):
+                            bins.append(f)
+        main_js = p / "resources" / "app" / "out" / "main.js"
+        if main_js.is_file():
+            jss.append(main_js)
+    return bins, jss
+
+
+def _dedup(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for p in paths:
+        k = str(p)
+        if k not in seen:
+            seen.add(k)
+            out.append(p)
+    return out
+
+
+def collect_targets(extra_paths: list[Path] | None = None) -> tuple[list[Path], list[Path]]:
+    bins = list(DEFAULT_BIN_TARGETS)
+    jss = list(DEFAULT_JS_TARGETS)
+    for cp in load_saved_paths() + (extra_paths or []):
+        cb, cj = expand_custom_path(cp)
+        bins.extend(cb)
+        jss.extend(cj)
+    return _dedup(bins), _dedup(jss)
+
+
+def save_custom_path(raw: str) -> str:
+    p = _clean_path(raw)
+    if not p.exists():
+        return f"путь не найден: {p}"
+    bins, jss = expand_custom_path(p)
+    existing = [str(x) for x in load_saved_paths()]
+    if str(p) not in existing:
+        with PATHS_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"{p}\n")
+    found = len(bins) + len(jss)
+    return f"добавлено: {p} (найдено целей: {found})"
 
 
 def backup_key(p: Path) -> str:
@@ -249,11 +322,79 @@ def cert_info(host: str, ip: str) -> str:
         return f"ошибка TLS: {type(e).__name__}"
 
 
+def is_direct_google_ip(ip: str) -> bool:
+    return ip.startswith(("172.217.", "142.250.", "142.251.", "216.58."))
+
+
+def cf_trace(family: int) -> dict[str, str] | None:
+    try:
+        infos = socket.getaddrinfo("www.cloudflare.com", 443, family, socket.SOCK_STREAM)
+        if not infos:
+            return None
+        addr = infos[0][4]
+        ctx = ssl.create_default_context()
+        with socket.socket(family, socket.SOCK_STREAM) as raw_sock:
+            raw_sock.settimeout(4)
+            raw_sock.connect(addr)
+            with ctx.wrap_socket(raw_sock, server_hostname="www.cloudflare.com") as ss:
+                ss.sendall(
+                    b"GET /cdn-cgi/trace HTTP/1.1\r\n"
+                    b"Host: www.cloudflare.com\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                chunks = []
+                while True:
+                    buf = ss.recv(4096)
+                    if not buf:
+                        break
+                    chunks.append(buf)
+        text = b"".join(chunks).decode("utf-8", errors="ignore")
+        body = text.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in text else text
+        res: dict[str, str] = {}
+        for line in body.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                res[k.strip()] = v.strip()
+        return res if "ip" in res else None
+    except Exception:
+        return None
+
+
+def google_geo_country() -> str | None:
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
+    try:
+        req = urllib.request.Request(
+            "https://policies.google.com/terms?hl=en",
+            headers={"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            html = r.read().decode("utf-8", errors="ignore")
+        m = re.search(r"Country version:</a>\s*([^<\n]+)", html)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+    try:
+        req = urllib.request.Request(
+            "https://www.youtube.com/?hl=en",
+            headers={"User-Agent": ua, "Cookie": "SOCS=CAI"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            html = r.read().decode("utf-8", errors="ignore")
+        m = re.search(r'"countryCode":"([A-Z]{2})"', html)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
 # --- команды ---------------------------------------------------------------
 
-def cmd_status() -> int:
+def cmd_status(extra_paths: list[Path] | None = None) -> int:
+    bins, jss = collect_targets(extra_paths)
     print("=== Клиентский гейт: патч ineligible -> inexeligible ===")
-    for p in BIN_TARGETS:
+    for p in bins:
         if not p.exists():
             print(f"  {p}\n      нет файла")
             continue
@@ -264,7 +405,7 @@ def cmd_status() -> int:
               f"  -> {'ПРОПАТЧЕН' if ok else 'НЕ ПРОПАТЧЕН'}")
 
     print("\n=== IDE: JS-обработчик отказа ===")
-    for p in JS_TARGETS:
+    for p in jss:
         if not p.exists():
             print(f"  {p}\n      нет файла")
             continue
@@ -275,62 +416,99 @@ def cmd_status() -> int:
         print(f"  {p}\n      -> {'ПРОПАТЧЕН' if patched else 'НЕ ПРОПАТЧЕН'}")
 
     print("\n=== Сеть: DNS-подмена gate-хостов (ничего не меняем) ===")
-    for h in GATE_HOSTS:
+    for h in GATE_HOSTS + [AUTH_HOST]:
         ips = resolve(h)
         print(f"  {h}\n      {', '.join(ips) if ips else 'НЕ РАЗРЕШАЕТСЯ'}")
     return 0
 
 
-def cmd_apply() -> int:
+def cmd_apply(extra_paths: list[Path] | None = None) -> int:
+    bins, jss = collect_targets(extra_paths)
     print("=== Бинари ===")
-    for p in BIN_TARGETS:
+    for p in bins:
         print(f"  {p}: {patch_binary(p)}")
     print("\n=== IDE JS ===")
-    for p in JS_TARGETS:
+    for p in jss:
         print(f"  {p}: {patch_js(p)}")
     print(f"\nБэкапы: {BACKUP_DIR}")
     print("Перезапустите Antigravity / Antigravity IDE.")
     return 0
 
 
-def cmd_revert() -> int:
-    for p in BIN_TARGETS:
+def cmd_revert(extra_paths: list[Path] | None = None) -> int:
+    bins, jss = collect_targets(extra_paths)
+    for p in bins:
         print(f"  {p}: {revert_binary(p)}")
-    for p in JS_TARGETS:
+    for p in jss:
         print(f"  {p}: {revert_js(p)}")
     return 0
 
 
 def cmd_verify() -> int:
     ok = True
+    daily_ip = ""
     print("=== DNS-подмена + TLS ===")
-    for h in GATE_HOSTS:
+    for h in GATE_HOSTS + [AUTH_HOST]:
         ips = resolve(h)
         if not ips:
             print(f"  {h}: НЕ РАЗРЕШАЕТСЯ")
             ok = False
             continue
         ip = ips[0]
+        if h == "daily-cloudcode-pa.googleapis.com":
+            daily_ip = ip
+        if ip.startswith("127."):
+            print(f"  {h}\n      {ip}\n      ВНИМАНИЕ: локальный редирект (остатки AG Unlocker / NRPT / hosts)")
+            ok = False
+            continue
         info = cert_info(h, ip)
         print(f"  {h}\n      {ip}\n      сертификат: {info}")
         if "Google" not in info:
             print("      ВНИМАНИЕ: сертификат не Google")
+            if "Timeout" in info or "timed out" in info.lower():
+                print("      ПОДСКАЗКА: таймаут TLS handshake — проверьте TUN/MTU (в Happ: Sing-box вместо Xray TUN) или DPI/корп. VPN")
             ok = False
+
+    print("\n=== Внешний IP и геолокация Google ===")
+    cf4 = cf_trace(socket.AF_INET)
+    cf6 = cf_trace(socket.AF_INET6)
+    loc4 = (cf4 or {}).get("loc", "")
+    loc6 = (cf6 or {}).get("loc", "")
+    if cf4:
+        print(f"  IPv4 (Cloudflare): {cf4.get('ip')}  loc={loc4}  colo={cf4.get('colo', '?')}")
+    else:
+        print("  IPv4 (Cloudflare): недоступен")
+    if cf6:
+        print(f"  IPv6 (Cloudflare): {cf6.get('ip')}  loc={loc6}  colo={cf6.get('colo', '?')}")
+    else:
+        print("  IPv6 (Cloudflare): нет / не используется")
+
+    g_country = google_geo_country()
+    print(f"  Геолокация Google: {g_country if g_country else 'не удалось определить'}")
+
+    if daily_ip and is_direct_google_ip(daily_ip) and loc4.upper() in BLOCKED_COUNTRIES:
+        print(f"  ВНИМАНИЕ: нет ни VPN, ни DNS-подмены — трафик идёт напрямую из {loc4}")
+        ok = False
+    if loc4 and loc4.upper() not in BLOCKED_COUNTRIES and loc6.upper() in BLOCKED_COUNTRIES:
+        print(f"  ВНИМАНИЕ: утечка IPv6 мимо VPN ({loc6})")
+        ok = False
+    if g_country and g_country.upper() in BLOCKED_COUNTRIES and loc4 and loc4.upper() not in BLOCKED_COUNTRIES:
+        print(f"  ВНИМАНИЕ: Google считает ваш VPN-сервер российским ({g_country}) — смените сервер/локацию или используйте DNS-подмену")
+        ok = False
 
     print("\n=== Ответ сервера (401 = запрос дошёл до Google) ===")
     h = "daily-cloudcode-pa.googleapis.com"
-    ips = resolve(h)
-    if ips:
+    if daily_ip and not daily_ip.startswith("127."):
         r = subprocess.run(
             ["curl", "-s", "--max-time", "15",
-             "--resolve", f"{h}:443:{ips[0]}",
+             "--resolve", f"{h}:443:{daily_ip}",
              "-X", "POST", f"https://{h}/v1internal:loadCodeAssist",
              "-H", "Authorization: Bearer probe",
              "-H", "Content-Type: application/json",
              "-d", '{"metadata":{"pluginType":"ANTIGRAVITY","ideType":"IDE"}}'],
             capture_output=True, text=True)
         print(f"  {h}: {r.stdout[:220]}")
-        if "UNAUTHENTICATED" not in r.stdout:
+        if "UNAUTHENTICATED" not in r.stdout and '"code": 401' not in r.stdout:
             print("      ВНИМАНИЕ: не 401")
             ok = False
     print("\nИтог:", "ОК" if ok else "есть проблемы")
@@ -340,7 +518,7 @@ def cmd_verify() -> int:
 def run_gui() -> int:
     try:
         import tkinter as tk
-        from tkinter import scrolledtext
+        from tkinter import filedialog, scrolledtext
     except Exception:
         print(f"tkinter не найден — используйте CLI-команды.\nЧат поддержки: {SUPPORT_URL}")
         print(__doc__)
@@ -354,7 +532,7 @@ def run_gui() -> int:
         return 2
 
     root.title("ag-unblock")
-    root.geometry("760x500")
+    root.geometry("780x520")
     root.configure(bg="#18181b")
 
     top = tk.Frame(root, bg="#18181b")
@@ -408,13 +586,21 @@ def run_gui() -> int:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def add_folder() -> None:
+        d = filedialog.askdirectory(title="Выберите папку установки Antigravity / IDE")
+        if d:
+            msg = save_custom_path(d)
+            run_task(lambda: (print(msg + "\n"), cmd_status()))
+
     for label, fn, bg in [
         ("Статус", cmd_status, "#27272a"),
         ("Применить патч", cmd_apply, "#2563eb"),
         ("Откатить", cmd_revert, "#27272a"),
         ("Проверить сеть", cmd_verify, "#27272a"),
+        ("+ Папка", add_folder, "#27272a"),
     ]:
-        b = tk.Button(btns, text=label, command=lambda f=fn: run_task(f),
+        cmd = fn if label == "+ Папка" else (lambda f=fn: run_task(f))
+        b = tk.Button(btns, text=label, command=cmd,
                       bg=bg, fg="#f4f4f5", activebackground="#3f3f46",
                       activeforeground="#ffffff", relief=tk.FLAT, padx=12, pady=6,
                       cursor="hand2")
@@ -434,19 +620,40 @@ def run_gui() -> int:
     return 0
 
 
+def _parse_extra_paths(argv: list[str]) -> list[Path]:
+    out: list[Path] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--path" and i + 1 < len(argv):
+            out.append(_clean_path(argv[i + 1]))
+            i += 2
+        else:
+            i += 1
+    return out
+
+
 def main() -> int:
-    cmds = {"status": cmd_status, "apply": cmd_apply,
-            "revert": cmd_revert, "verify": cmd_verify}
     if len(sys.argv) < 2 or sys.argv[1] in ("gui", "--gui"):
         return run_gui()
-    if sys.argv[1] == "support":
+    cmd = sys.argv[1]
+    extra = _parse_extra_paths(sys.argv[2:])
+    if cmd == "status":
+        return cmd_status(extra)
+    if cmd == "apply":
+        return cmd_apply(extra)
+    if cmd == "revert":
+        return cmd_revert(extra)
+    if cmd == "verify":
+        return cmd_verify()
+    if cmd == "add-path" and len(sys.argv) >= 3:
+        print(save_custom_path(sys.argv[2]))
+        return 0
+    if cmd == "support":
         print(f"Чат поддержки: {SUPPORT_URL}")
         webbrowser.open(SUPPORT_URL)
         return 0
-    if sys.argv[1] not in cmds:
-        print(__doc__)
-        return 2
-    return cmds[sys.argv[1]]()
+    print(__doc__)
+    return 2
 
 
 if __name__ == "__main__":
